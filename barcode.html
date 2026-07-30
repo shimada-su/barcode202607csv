@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>バーコード連続スキャナー</title>
+  <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+  <style>
+    :root {
+      --primary-color: #007bff;
+      --success-color: #28a745;
+      --danger-color: #dc3545;
+      --bg-color: #f8f9fa;
+      --card-bg: #ffffff;
+      --text-color: #333333;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    body {
+      background-color: var(--bg-color);
+      color: var(--text-color);
+      padding: 12px;
+      padding-bottom: 80px;
+    }
+
+    h1 {
+      font-size: 1.2rem;
+      text-align: center;
+      margin-bottom: 12px;
+      color: #1a1a1a;
+    }
+
+    /* カメラプレビュー領域 */
+    #reader-container {
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      margin-bottom: 16px;
+      position: relative;
+    }
+
+    #reader {
+      width: 100%;
+    }
+
+    /* コントロールボタン群 */
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    button {
+      flex: 1;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      font-weight: bold;
+      font-size: 0.95rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: opacity 0.2s;
+    }
+
+    button:active {
+      opacity: 0.8;
+    }
+
+    .btn-primary { background-color: var(--primary-color); color: #fff; }
+    .btn-success { background-color: var(--success-color); color: #fff; }
+    .btn-danger { background-color: #e9ecef; color: var(--danger-color); border: 1px solid #ced4da; }
+
+    /* ステータス・カウント表示 */
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--card-bg);
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+
+    .count-badge {
+      font-size: 1.1rem;
+      font-weight: bold;
+      color: var(--primary-color);
+    }
+
+    /* 読み取りデータリスト */
+    .list-container {
+      background: var(--card-bg);
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    .data-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid #eee;
+    }
+
+    .data-item:last-child {
+      border-bottom: none;
+    }
+
+    .data-info {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .data-val {
+      font-weight: bold;
+      font-size: 1rem;
+      word-break: break-all;
+    }
+
+    .data-meta {
+      font-size: 0.75rem;
+      color: #6c757d;
+    }
+
+    .btn-delete {
+      background: none;
+      border: none;
+      color: var(--danger-color);
+      font-size: 1.2rem;
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+
+    /* 固定ボトムアクションバー */
+    .footer-actions {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #ffffff;
+      padding: 12px 16px;
+      box-shadow: 0 -2px 10px rgba(0,0,0,0.1);
+      display: flex;
+      gap: 10px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>📱 バーコード連続スキャナー</h1>
+
+  <div id="reader-container">
+    <div id="reader"></div>
+  </div>
+
+  <div class="status-bar">
+    <span>読み取り件数</span>
+    <span class="count-badge" id="scan-count">0 件</span>
+  </div>
+
+  <div class="controls">
+    <button id="btn-toggle" class="btn-primary" onclick="toggleScan()">一時停止</button>
+    <button class="btn-danger" onclick="clearAllData()">全クリア</button>
+  </div>
+
+  <div class="list-container" id="data-list">
+    </div>
+
+  <div class="footer-actions">
+    <button class="btn-success" onclick="exportAndShareCSV()">
+      📄 CSV保存 / ドライブに送信
+    </button>
+  </div>
+
+  <script>
+    let html5QrCode = null;
+    let isScanning = false;
+    let scannedData = []; // スキャン結果の配列 [{no, barcode, timestamp, format}]
+    let lastScannedCode = "";
+    let lastScannedTime = 0;
+    const DUPLICATE_INTERVAL = 1500; // 重複読み取り防止タイマー (1.5秒)
+
+    // Web Audio APIによるビープ音生成
+    function playBeep() {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 1000; // 1000Hz
+        gain.gain.value = 0.1;
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.12);
+      } catch (e) {
+        console.error("Audio error", e);
+      }
+    }
+
+    // バイブレーション処理
+    function triggerVibrate() {
+      if ("vibrate" in navigator) {
+        navigator.vibrate(100);
+      }
+    }
+
+    // カメラの初期化とスキャン開始
+    function startScanner() {
+      html5QrCode = new Html5Qrcode("reader");
+      const config = { 
+        fps: 10, 
+        qrbox: { width: 250, height: 150 },
+        aspectRatio: 1.333
+      };
+
+      html5QrCode.start(
+        { facingMode: "environment" }, // 背面カメラ指定
+        config,
+        onScanSuccess
+      ).then(() => {
+        isScanning = true;
+        document.getElementById('btn-toggle').innerText = "一時停止";
+      }).catch(err => {
+        alert("カメラの起動に失敗しました: " + err);
+      });
+    }
+
+    // バーコード検知時の処理
+    function onScanSuccess(decodedText, decodedResult) {
+      const now = Date.now();
+      
+      // 同じバーコードの連続読み取り防止 (1.5秒以内は無視)
+      if (decodedText === lastScannedCode && (now - lastScannedTime) < DUPLICATE_INTERVAL) {
+        return;
+      }
+
+      lastScannedCode = decodedText;
+      lastScannedTime = now;
+
+      // 通知音 ＆ バイブ
+      playBeep();
+      triggerVibrate();
+
+      // データの追加
+      const format = decodedResult.result.format ? decodedResult.result.format.formatName : "UNKNOWN";
+      const timestamp = new Date().toLocaleString("ja-JP");
+
+      const item = {
+        no: scannedData.length + 1,
+        barcode: decodedText,
+        timestamp: timestamp,
+        format: format
+      };
+
+      scannedData.unshift(item); // 先頭に追加
+      updateUI();
+    }
+
+    // 一時停止 / 再開の切り替え
+    function toggleScan() {
+      if (!html5QrCode) return;
+
+      const btn = document.getElementById('btn-toggle');
+      if (isScanning) {
+        html5QrCode.pause(true);
+        isScanning = false;
+        btn.innerText = "スキャン再開";
+        btn.style.backgroundColor = "#6c757d";
+      } else {
+        html5QrCode.resume();
+        isScanning = true;
+        btn.innerText = "一時停止";
+        btn.style.backgroundColor = "var(--primary-color)";
+      }
+    }
+
+    // 画面の更新
+    function updateUI() {
+      document.getElementById('scan-count').innerText = `${scannedData.length} 件`;
+      const listContainer = document.getElementById('data-list');
+      listContainer.innerHTML = "";
+
+      scannedData.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.className = 'data-item';
+        div.innerHTML = `
+          <div class="data-info">
+            <span class="data-val">${escapeHtml(item.barcode)}</span>
+            <span class="data-meta">#${scannedData.length - index} | ${item.timestamp} | ${item.format}</span>
+          </div>
+          <button class="btn-delete" onclick="deleteItem(${index})">✕</button>
+        `;
+        listContainer.appendChild(div);
+      });
+    }
+
+    // 個別削除
+    function deleteItem(index) {
+      scannedData.splice(index, 1);
+      // 連番の再振り分け
+      scannedData.forEach((item, idx) => {
+        item.no = scannedData.length - idx;
+      });
+      updateUI();
+    }
+
+    // 全削除
+    function clearAllData() {
+      if (scannedData.length === 0) return;
+      if (confirm("スキャン履歴をすべて削除しますか？")) {
+        scannedData = [];
+        lastScannedCode = "";
+        updateUI();
+      }
+    }
+
+    // エスケープ処理
+    function escapeHtml(str) {
+      return str.replace(/[&<>"']/g, function(m) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m];
+      });
+    }
+
+    // CSVの生成とドライブ共有 / ダウンロード
+    async function exportAndShareCSV() {
+      if (scannedData.length === 0) {
+        alert("保存するデータがありません。");
+        return;
+      }
+
+      // CSVヘッダーとデータ構築
+      let csvContent = "\uFEFFNo,Barcode,Timestamp,Format\n"; // UTF-8 BOM付き（Excel文字化け防止）
+      
+      // 元の順番（古い順）にして出力
+      const exportList = [...scannedData].reverse();
+      exportList.forEach((item, idx) => {
+        csvContent += `${idx + 1},"${item.barcode.replace(/"/g, '""')}","${item.timestamp}","${item.format}"\n`;
+      });
+
+      // ファイル名生成 (例: barcode_scan_20260730_103000.csv)
+      const now = new Date();
+      const dateStr = now.getFullYear() +
+        String(now.getMonth() + 1).padStart(2, '0') +
+        String(now.getDate()).padStart(2, '0') + "_" +
+        String(now.getHours()).padStart(2, '0') +
+        String(now.getMinutes()).padStart(2, '0') +
+        String(now.getSeconds()).padStart(2, '0');
+      const filename = `barcode_scan_${dateStr}.csv`;
+
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const file = new File([blob], filename, { type: "text/csv" });
+
+      // Web Share API（スマホの「共有」メニュー呼び出し）でGoogle ドライブへ送信
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({
+            files: [file],
+            title: "バーコードスキャンデータ",
+            text: "読み取ったバーコードデータCSV"
+          });
+        } catch (err) {
+          if (err.name !== "AbortError") {
+            downloadCSV(blob, filename);
+          }
+        }
+      } else {
+        // Web Share未対応環境の場合は通常のダウンロード
+        downloadCSV(blob, filename);
+      }
+    }
+
+    // フォールバック用直接ダウンロード関数
+    function downloadCSV(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    // ページ読み込み時にカメラ起動
+    window.addEventListener("DOMContentLoaded", startScanner);
+  </script>
+</body>
+</html>
