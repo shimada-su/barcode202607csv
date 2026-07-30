@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b5cab">
+  <title>バーコード連続スキャン</title>
+  <script src="https://unpkg.com/html5-qrcode" defer></script>
+  <style>
+    :root { --blue:#0b5cab; --navy:#073a6b; --ink:#17212b; --muted:#64748b; --line:#dbe4ee; --bg:#f3f7fb; --danger:#c62828; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif; }
+    main { max-width:680px; margin:auto; padding:16px 14px calc(116px + env(safe-area-inset-bottom)); }
+    h1 { margin:2px 0 14px; font-size:1.3rem; color:var(--navy); }
+    .camera-card, .list-card { overflow:hidden; background:#fff; border:1px solid var(--line); border-radius:14px; box-shadow:0 2px 8px #0f274008; }
+    #reader { min-height:190px; background:#101820; }
+    #reader video { object-fit:cover; }
+    #reader__dashboard { padding:8px !important; color:#fff !important; }
+    .camera-note { margin:0; padding:10px 12px; color:var(--muted); font-size:.82rem; }
+    .summary { display:flex; align-items:center; justify-content:space-between; margin:20px 2px 10px; }
+    .summary h2 { margin:0; font-size:1.02rem; }
+    .count { padding:5px 10px; border-radius:100px; color:var(--blue); background:#e6f1fc; font-size:.9rem; font-weight:700; }
+    .list-card { min-height:115px; }
+    #scanList { margin:0; padding:0; list-style:none; }
+    .empty { padding:38px 16px; color:var(--muted); text-align:center; font-size:.92rem; }
+    .scan-row { display:grid; grid-template-columns:38px minmax(0,1fr) 34px; gap:9px; align-items:center; padding:12px; border-bottom:1px solid var(--line); }
+    .scan-row:last-child { border-bottom:0; }
+    .no { display:grid; place-items:center; width:31px; height:31px; color:var(--blue); background:#eaf3fc; border-radius:50%; font-size:.8rem; font-weight:700; }
+    .barcode { overflow-wrap:anywhere; font-weight:700; letter-spacing:.01em; }
+    .meta { margin-top:4px; color:var(--muted); font-size:.74rem; }
+    .delete { width:34px; height:34px; padding:0; border:0; border-radius:50%; color:var(--danger); background:#fff0f0; font-size:1.15rem; cursor:pointer; }
+    .action-bar { position:fixed; z-index:5; right:0; bottom:0; left:0; display:grid; grid-template-columns:1fr 1fr; gap:9px; padding:10px 14px calc(10px + env(safe-area-inset-bottom)); background:#ffffffef; border-top:1px solid var(--line); box-shadow:0 -3px 14px #0f274014; }
+    button { min-height:48px; border:0; border-radius:11px; font:inherit; font-weight:700; cursor:pointer; touch-action:manipulation; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .primary { color:#fff; background:var(--blue); }
+    .primary:active { background:var(--navy); }
+    .secondary { color:var(--blue); background:#eaf3fc; }
+    .clear { grid-column:1 / -1; min-height:38px; color:var(--danger); background:#fff; border:1px solid #f0c9c9; font-size:.86rem; }
+    @media (min-width:560px) { .action-bar { left:50%; max-width:680px; transform:translateX(-50%); border-right:1px solid var(--line); border-left:1px solid var(--line); } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>バーコード連続スキャン</h1>
+    <section class="camera-card" aria-label="カメラ">
+      <div id="reader"></div>
+      <p class="camera-note" id="cameraStatus">「スキャン開始」を押すと背面カメラを起動します。</p>
+    </section>
+    <section aria-labelledby="listTitle">
+      <div class="summary"><h2 id="listTitle">読み取り結果</h2><span class="count" id="count">合計 0 件</span></div>
+      <div class="list-card"><ul id="scanList" aria-live="polite"></ul><div id="empty" class="empty">まだ読み取りデータはありません</div></div>
+    </section>
+  </main>
+  <nav class="action-bar" aria-label="操作">
+    <button id="scanButton" class="primary" type="button">スキャン開始</button>
+    <button id="saveButton" class="secondary" type="button" disabled>CSV保存 / ドライブに送信</button>
+    <button id="clearButton" class="clear" type="button" disabled>全クリア</button>
+  </nav>
+
+  <script>
+    (() => {
+      const readerId = 'reader';
+      const ui = {
+        scan: document.getElementById('scanButton'), save: document.getElementById('saveButton'),
+        clear: document.getElementById('clearButton'), list: document.getElementById('scanList'),
+        empty: document.getElementById('empty'), count: document.getElementById('count'), status: document.getElementById('cameraStatus')
+      };
+      const scans = []; // 先頭が最も古い読み取りデータ
+      const lastDetected = new Map();
+      let scanner = null;
+      let scanState = 'idle'; // idle | scanning | paused
+      let audioContext = null;
+
+      const pad = n => String(n).padStart(2, '0');
+      function timestamp(date) {
+        return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+      }
+      function fileTimestamp(date) {
+        return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+      }
+      function getFormat(result) {
+        const format = result && result.result && result.result.format;
+        return (format && (format.formatName || format.name || String(format))) || 'UNKNOWN';
+      }
+      function render() {
+        ui.list.textContent = '';
+        [...scans].reverse().forEach((item, reverseIndex) => {
+          const number = scans.length - reverseIndex;
+          const row = document.createElement('li');
+          row.className = 'scan-row';
+          const no = document.createElement('span'); no.className = 'no'; no.textContent = number;
+          const info = document.createElement('div');
+          const code = document.createElement('div'); code.className = 'barcode'; code.textContent = item.barcode;
+          const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${item.timestamp}　${item.format}`;
+          info.append(code, meta);
+          const del = document.createElement('button'); del.className = 'delete'; del.type = 'button'; del.textContent = '×'; del.setAttribute('aria-label', `${item.barcode} を削除`);
+          del.addEventListener('click', () => { scans.splice(scans.indexOf(item), 1); render(); });
+          row.append(no, info, del); ui.list.append(row);
+        });
+        const hasData = scans.length > 0;
+        ui.empty.hidden = hasData;
+        ui.count.textContent = `合計 ${scans.length} 件`;
+        ui.save.disabled = !hasData;
+        ui.clear.disabled = !hasData;
+      }
+      function feedback() {
+        try {
+          audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+          if (audioContext.state === 'suspended') audioContext.resume();
+          const oscillator = audioContext.createOscillator(), gain = audioContext.createGain();
+          oscillator.type = 'sine'; oscillator.frequency.value = 1250; gain.gain.setValueAtTime(.12, audioContext.currentTime);
+          gain.gain.exponentialRampToValueAtTime(.001, audioContext.currentTime + .12);
+          oscillator.connect(gain).connect(audioContext.destination); oscillator.start(); oscillator.stop(audioContext.currentTime + .12);
+        } catch (_) { /* 音声が許可されない環境では無音 */ }
+        if (navigator.vibrate) navigator.vibrate(100);
+      }
+      function onScanSuccess(decodedText, decodedResult) {
+        const now = Date.now();
+        if (now - (lastDetected.get(decodedText) || 0) < 5000) return;
+        lastDetected.set(decodedText, now);
+        scans.push({ barcode: decodedText, timestamp: timestamp(new Date()), format: getFormat(decodedResult) });
+        feedback(); render();
+      }
+      async function startScanner() {
+        if (!window.Html5Qrcode) { ui.status.textContent = 'スキャン機能の読み込みに失敗しました。通信状況を確認して再読み込みしてください。'; return; }
+        ui.scan.disabled = true;
+        try {
+          scanner ||= new Html5Qrcode(readerId, { verbose: false });
+          await scanner.start({ facingMode: { exact: 'environment' } }, { fps: 10, qrbox: { width: 280, height: 180 } }, onScanSuccess, () => {});
+          scanState = 'scanning'; ui.scan.textContent = '一時停止'; ui.status.textContent = 'カメラでバーコードを読み取っています。';
+        } catch (error) {
+          // 背面カメラ指定に対応しない端末では、利用可能なカメラへフォールバックする
+          try {
+            await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 280, height: 180 } }, onScanSuccess, () => {});
+            scanState = 'scanning'; ui.scan.textContent = '一時停止'; ui.status.textContent = 'カメラでバーコードを読み取っています。';
+          } catch (_) { ui.status.textContent = 'カメラを開始できませんでした。ブラウザのカメラ許可とHTTPS接続を確認してください。'; }
+        } finally { ui.scan.disabled = false; }
+      }
+      async function toggleScan() {
+        if (scanState === 'idle') return startScanner();
+        ui.scan.disabled = true;
+        try {
+          if (scanState === 'scanning') { scanner.pause(true); scanState = 'paused'; ui.scan.textContent = 'スキャン再開'; ui.status.textContent = 'スキャンを一時停止しています。'; }
+          else { scanner.resume(); scanState = 'scanning'; ui.scan.textContent = '一時停止'; ui.status.textContent = 'カメラでバーコードを読み取っています。'; }
+        } catch (_) { ui.status.textContent = 'スキャン状態の切り替えに失敗しました。'; }
+        finally { ui.scan.disabled = false; }
+      }
+      function csvValue(value) { return `"${String(value).replace(/"/g, '""')}"`; }
+      async function saveCsv() {
+        const rows = ['No,Barcode,Timestamp,Format', ...scans.map((item, index) => [index + 1, item.barcode, item.timestamp, item.format].map(csvValue).join(','))];
+        const filename = `barcode_scan_${fileTimestamp(new Date())}.csv`;
+        const file = new File(['\uFEFF' + rows.join('\r\n')], filename, { type: 'text/csv;charset=utf-8' });
+        try {
+          if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) { await navigator.share({ files: [file], title: 'バーコードスキャン結果' }); return; }
+        } catch (error) { if (error && error.name === 'AbortError') return; }
+        const url = URL.createObjectURL(file), a = document.createElement('a'); a.href = url; a.download = filename; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      ui.scan.addEventListener('click', toggleScan);
+      ui.save.addEventListener('click', saveCsv);
+      ui.clear.addEventListener('click', () => { if (confirm('読み取りデータをすべて削除しますか？')) { scans.length = 0; lastDetected.clear(); render(); } });
+      render();
+    })();
+  </script>
+</body>
+</html>
