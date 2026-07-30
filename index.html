@@ -44,10 +44,22 @@
       box-shadow: 0 4px 12px rgba(0,0,0,0.15);
       margin-bottom: 16px;
       position: relative;
+      min-height: 200px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     #reader {
       width: 100%;
+    }
+
+    #placeholder-text {
+      color: #aaa;
+      font-size: 0.9rem;
+      position: absolute;
+      text-align: center;
+      pointer-events: none;
     }
 
     /* コントロールボタン群 */
@@ -79,6 +91,7 @@
     .btn-primary { background-color: var(--primary-color); color: #fff; }
     .btn-success { background-color: var(--success-color); color: #fff; }
     .btn-danger { background-color: #e9ecef; color: var(--danger-color); border: 1px solid #ced4da; }
+    .btn-secondary { background-color: #6c757d; color: #fff; }
 
     /* ステータス・カウント表示 */
     .status-bar {
@@ -160,6 +173,249 @@
 </head>
 <body>
 
-test
+  <h1>📱 バーコード連続スキャナー</h1>
+
+  <div id="reader-container">
+    <div id="placeholder-text">「スキャン開始」を押してカメラを起動</div>
+    <div id="reader"></div>
+  </div>
+
+  <div class="status-bar">
+    <span>読み取り件数</span>
+    <span class="count-badge" id="scan-count">0 件</span>
+  </div>
+
+  <div class="controls">
+    <button id="btn-toggle" class="btn-primary" onclick="toggleScan()">スキャン開始</button>
+    <button class="btn-danger" onclick="clearAllData()">全クリア</button>
+  </div>
+
+  <div class="list-container" id="data-list">
+    </div>
+
+  <div class="footer-actions">
+    <button class="btn-success" onclick="exportAndShareCSV()">
+      📄 CSV保存 / ドライブに送信
+    </button>
+  </div>
+
+  <script>
+    let html5QrCode = null;
+    let isScanning = false;
+    let isCameraActive = false; // カメラが初期化されているかどうか
+    let scannedData = []; 
+    let lastScannedCode = "";
+    let lastScannedTime = 0;
+    
+    // 【修正点】重複読み取り防止タイマーを 5000ms (5秒) に変更
+    const DUPLICATE_INTERVAL = 5000; 
+
+    // Web Audio APIによるビープ音生成
+    function playBeep() {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 1000;
+        gain.gain.value = 0.1;
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.12);
+      } catch (e) {
+        console.error("Audio error", e);
+      }
+    }
+
+    // バイブレーション処理
+    function triggerVibrate() {
+      if ("vibrate" in navigator) {
+        navigator.vibrate(100);
+      }
+    }
+
+    // カメラの起動とスキャン開始
+    function startScanner() {
+      html5QrCode = new Html5Qrcode("reader");
+      const config = { 
+        fps: 10, 
+        qrbox: { width: 250, height: 150 },
+        aspectRatio: 1.333
+      };
+
+      document.getElementById('placeholder-text').style.display = 'none';
+
+      html5QrCode.start(
+        { facingMode: "environment" },
+        config,
+        onScanSuccess
+      ).then(() => {
+        isScanning = true;
+        isCameraActive = true;
+        const btn = document.getElementById('btn-toggle');
+        btn.innerText = "一時停止";
+        btn.className = "btn-secondary";
+      }).catch(err => {
+        document.getElementById('placeholder-text').style.display = 'block';
+        alert("カメラの起動に失敗しました: " + err);
+      });
+    }
+
+    // バーコード検知時の処理
+    function onScanSuccess(decodedText, decodedResult) {
+      const now = Date.now();
+      
+      // 【修正点】同じバーコードが5秒以内に読み込まれた場合は無視
+      if (decodedText === lastScannedCode && (now - lastScannedTime) < DUPLICATE_INTERVAL) {
+        return;
+      }
+
+      lastScannedCode = decodedText;
+      lastScannedTime = now;
+
+      playBeep();
+      triggerVibrate();
+
+      const format = decodedResult.result.format ? decodedResult.result.format.formatName : "UNKNOWN";
+      const timestamp = new Date().toLocaleString("ja-JP");
+
+      const item = {
+        no: scannedData.length + 1,
+        barcode: decodedText,
+        timestamp: timestamp,
+        format: format
+      };
+
+      scannedData.unshift(item);
+      updateUI();
+    }
+
+    // 【修正点】スタート・一時停止・再開の切り替え制御
+    function toggleScan() {
+      const btn = document.getElementById('btn-toggle');
+
+      // 1. 初回または停止状態からの起動
+      if (!isCameraActive) {
+        startScanner();
+        return;
+      }
+
+      // 2. 起動中の「一時停止」と「再開」のトグル処理
+      if (isScanning) {
+        html5QrCode.pause(true);
+        isScanning = false;
+        btn.innerText = "スキャン再開";
+        btn.className = "btn-primary";
+      } else {
+        html5QrCode.resume();
+        isScanning = true;
+        btn.innerText = "一時停止";
+        btn.className = "btn-secondary";
+      }
+    }
+
+    // 画面の更新
+    function updateUI() {
+      document.getElementById('scan-count').innerText = `${scannedData.length} 件`;
+      const listContainer = document.getElementById('data-list');
+      listContainer.innerHTML = "";
+
+      scannedData.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.className = 'data-item';
+        div.innerHTML = `
+          <div class="data-info">
+            <span class="data-val">${escapeHtml(item.barcode)}</span>
+            <span class="data-meta">#${scannedData.length - index} | ${item.timestamp} | ${item.format}</span>
+          </div>
+          <button class="btn-delete" onclick="deleteItem(${index})">✕</button>
+        `;
+        listContainer.appendChild(div);
+      });
+    }
+
+    // 個別削除
+    function deleteItem(index) {
+      scannedData.splice(index, 1);
+      scannedData.forEach((item, idx) => {
+        item.no = scannedData.length - idx;
+      });
+      updateUI();
+    }
+
+    // 全削除
+    function clearAllData() {
+      if (scannedData.length === 0) return;
+      if (confirm("スキャン履歴をすべて削除しますか？")) {
+        scannedData = [];
+        lastScannedCode = "";
+        updateUI();
+      }
+    }
+
+    // エスケープ処理
+    function escapeHtml(str) {
+      return str.replace(/[&<>"']/g, function(m) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m];
+      });
+    }
+
+    // CSVの生成とドライブ共有 / ダウンロード
+    async function exportAndShareCSV() {
+      if (scannedData.length === 0) {
+        alert("保存するデータがありません。");
+        return;
+      }
+
+      let csvContent = "\uFEFFNo,Barcode,Timestamp,Format\n";
+      const exportList = [...scannedData].reverse();
+      exportList.forEach((item, idx) => {
+        csvContent += `${idx + 1},"${item.barcode.replace(/"/g, '""')}","${item.timestamp}","${item.format}"\n`;
+      });
+
+      const now = new Date();
+      const dateStr = now.getFullYear() +
+        String(now.getMonth() + 1).padStart(2, '0') +
+        String(now.getDate()).padStart(2, '0') + "_" +
+        String(now.getHours()).padStart(2, '0') +
+        String(now.getMinutes()).padStart(2, '0') +
+        String(now.getSeconds()).padStart(2, '0');
+      const filename = `barcode_scan_${dateStr}.csv`;
+
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const file = new File([blob], filename, { type: "text/csv" });
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({
+            files: [file],
+            title: "バーコードスキャンデータ",
+            text: "読み取ったバーコードデータCSV"
+          });
+        } catch (err) {
+          if (err.name !== "AbortError") {
+            downloadCSV(blob, filename);
+          }
+        }
+      } else {
+        downloadCSV(blob, filename);
+      }
+    }
+
+    // フォールバック用直接ダウンロード関数
+    function downloadCSV(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    // 【修正点】自動起動用のイベントリスナーを削除しました
+  </script>
 </body>
 </html>
